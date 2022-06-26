@@ -4,69 +4,58 @@ import (
 	"flag"
 	"fmt"
 	log "github.com/sirupsen/logrus"
-	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
-const (
-	layout = "2006-01-02 15:04:05"
-)
 
-const (
-	stdout = "stdout"
-)
 
 var (
 	host          string
 	port          int64
 	user          string
 	password      string
-	startFile     string
-	startPosition int64
-	startTime     string
-	stopFile      string
-	stopPosition  int64
-	gtidRegexp    string
-	stopTime      string
-	database      string
-	onlyTables    string
-	onlySqlType   string
-	onlyDML       bool
-	outputFile    string
-	noPrimaryKey  bool
-	flashback     bool
+	StartFile     string
+	StartPosition int64
+	StartTime    string
+	StopFile     string
+	StopPosition int64
+	GtidRegexp   string
+	StopTime     string
+	Database     string
+	onlyTables   string
+	onlySqlType  string
+	OnlyDML      bool
+	FilterTx     bool
+	OutputFile   string
+	Rollback     bool
 )
 
 var (
-	binlogStartTime time.Time
-	binlogStopTime  time.Time
-	GTIDRegexp      *regexp.Regexp
-	onlyTablesList  []string
-	onlySqlTypeList []string
+	OnlyTablesList  []string
+	OnlySqlTypeList []string
 	MysqlURI        string
 )
 
 func initVar() {
-	flag.StringVar(&host, "host", "127.0.0.1", "mysql host")
-	flag.Int64Var(&port, "port", 3306, "mysql port")
-	flag.StringVar(&user, "user", "root", "mysql user")
-	flag.StringVar(&password, "password", "root", "mysql user password")
-	flag.StringVar(&startFile, "startFile", "", "start binlog file, fomat: mysql-bin.000001")
-	flag.Int64Var(&startPosition, "startPos", 0, "start position in binlog file")
-	flag.StringVar(&startTime, "startTime", "", "start time in binlog file, format: 2006-01-02 15:04:05")
-	flag.StringVar(&stopFile, "stopFile", "", "stop binlog file")
-	flag.Int64Var(&stopPosition, "stopPos", 0, "stop position in binlog file")
-	flag.StringVar(&gtidRegexp, "gtidRegexp", "", "gitd regexp")
-	flag.StringVar(&stopTime, "stopTime", "2022-06-20 15:05:37", "stop time in binlog file")
-	flag.StringVar(&database, "database", "", "database you want")
-	flag.StringVar(&onlyTables, "onlyTables", "", "table you want")
-	flag.StringVar(&onlySqlType, "onlySqlType", "INSERT,UPDATE,DELETE", "sql type you want")
-	flag.BoolVar(&onlyDML, "onlyDML", true, "ignore ddl")
-	flag.StringVar(&outputFile, "outputFile", stdout, "output file")
-	flag.BoolVar(&noPrimaryKey, "noPrimaryKey", false, "no primary key")
-	flag.BoolVar(&flashback, "flashback", false, "flashback")
+	flag.StringVar(&host, "h", "127.0.0.1", "mysql host")
+	flag.Int64Var(&port, "P", 3306, "mysql port")
+	flag.StringVar(&user, "u", "root", "mysql user")
+	flag.StringVar(&password, "p", "root", "mysql user password")
+	flag.StringVar(&Database, "d", "", "database you want")
+	flag.StringVar(&onlyTables, "t", "", "table you want")
+	flag.StringVar(&StartFile, "start-file", "", "start binlog file, fomat: mysql-bin.000001")
+	flag.Int64Var(&StartPosition, "start-pos", 0, "start position in binlog file")
+	flag.StringVar(&StartTime, "start-time", "", "start time in binlog file, format: 2006-01-02 15:04:05")
+	flag.StringVar(&StopFile, "stop-file", "", "stop binlog file")
+	flag.Int64Var(&StopPosition, "stop-pos", 0, "stop position in binlog file")
+	flag.StringVar(&GtidRegexp, "gtid-regexp", "", "gitd regexp")
+	flag.StringVar(&StopTime, "stop-time", "", "stop time in binlog file")
+	flag.StringVar(&onlySqlType, "only-sql-type", "INSERT,UPDATE,DELETE", "sql type you want")
+	flag.BoolVar(&OnlyDML, "only-DML", true, "ignore ddl")
+	flag.BoolVar(&FilterTx, "filter-tx", true, "filter transition")
+	flag.StringVar(&OutputFile, "output", stdout, "output file")
+	flag.BoolVar(&Rollback, "rollback", false, "rollback")
 	flag.Parse()
 }
 
@@ -81,23 +70,23 @@ func verifyBinlogFile(file string) bool {
 }
 
 func verifyVar() {
-	if len(startFile) == 0 {
+	if len(StartFile) == 0 {
 		log.Fatal("start file is empty")
 	}
-	if !verifyBinlogFile(startFile) {
+	if !verifyBinlogFile(StartFile) {
 		log.Fatal("start file format is illegal")
 	}
-	if len(stopFile) != 0 && !verifyBinlogFile(stopFile) {
+	if len(StopFile) != 0 && !verifyBinlogFile(StopFile) {
 		log.Fatal("stop file format is illegal")
 	}
-	if startPosition < 4 {
-		startPosition = 4
+	if StartPosition < 4 {
+		StartPosition = 4
 	}
-	if len(outputFile) == 0 {
-		if !flashback {
-			outputFile = "raw.sql"
+	if len(OutputFile) == 0 {
+		if !Rollback {
+			OutputFile = "raw.sql"
 		} else {
-			outputFile = "flashback.sql"
+			OutputFile = "rollback.sql"
 		}
 	}
 }
@@ -117,26 +106,9 @@ func splitVar(listVar string, f func(string) string) []string {
 }
 
 func globalVar() {
-	MysqlURI = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, database)
-	onlyTablesList = splitVar(onlyTables, nil)
-	onlySqlTypeList = splitVar(onlySqlType, nil)
-
-	var err error
-	if len(startTime) != 0 {
-		binlogStartTime, err = time.Parse(layout, startTime)
-		if err != nil {
-			log.Fatal("start time format is illegal")
-		}
-	}
-	if len(stopTime) != 0 {
-		binlogStopTime, err = time.Parse(layout, stopTime)
-		if err != nil {
-			log.Fatal("stop time format is illegal")
-		}
-	}
-	if len(gtidRegexp) != 0 {
-		GTIDRegexp = regexp.MustCompile(gtidRegexp)
-	}
+	MysqlURI = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, Database)
+	OnlyTablesList = splitVar(onlyTables, nil)
+	OnlySqlTypeList = splitVar(onlySqlType, nil)
 }
 
 func init() {

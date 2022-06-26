@@ -4,7 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/pingcap/errors"
+	"github.com/juju/errors"
+	"strings"
 )
 
 func LinkDB(uri string) (*DBMap, error) {
@@ -125,4 +126,35 @@ func getBinlogFromDb(db *sql.DB) ([]*BinlogInfo, error) {
 		})
 	}
 	return result, nil
+}
+
+func getGitdModeFromDb(db *sql.DB) (ok bool, err error) {
+	sql := "SELECT @@GLOBAL.GTID_MODE;"
+	rows, err := db.Query(sql)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	defer rows.Close()
+	var status string
+	for rows.Next() {
+		if err := rows.Scan(&status); err != nil {
+			return false, errors.Trace(err)
+		}
+	}
+	return strings.ToUpper(status) == "ON", nil
+}
+
+func getBinlogDirFromDb(db *sql.DB) (dirname string, err error) {
+	sql := `SHOW variables WHERE Variable_name = "log_bin_basename";`
+	rows, err := db.Query(sql)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err = rows.Scan(&dirname); err != nil {
+			return "", errors.Trace(err)
+		}
+	}
+	return
 }

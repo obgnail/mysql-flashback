@@ -3,7 +3,7 @@ package mysql_flashback
 import (
 	"fmt"
 	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/pingcap/errors"
+	"github.com/juju/errors"
 	"os"
 	"path"
 	"strings"

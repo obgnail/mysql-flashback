@@ -16,14 +16,18 @@ import (
 const (
 	SqlRowFormat    = "%s /* ROW -> binlog: %s | pos: (%d, %d) | time: %s */"
 	SqlDDLFormat    = "%s /* DDL -> binlog: %s | pos: (%d, %d) | time: %s */\n"
+	SqlGtidFormat   = "/* GTID -> %s | binlog: %s | pos: (%d, %d) | time: %s */"
 	SqlBeginFormat  = "/* BEGIN -> %s | binlog: %s | pos: (%d, %d) | time: %s */"
 	SqlCommitFormat = "/* COMMIT -> %s | binlog: %s | pos: (%d, %d) | time: %s */\n"
-)
 
-const (
 	SqlInsertFormat = "INSERT INTO `%s`.`%s`(%s) VALUES (%s);"
 	SqlUpdateFormat = "UPDATE `%s`.`%s` SET %s WHERE %s LIMIT 1;"
 	SqlDeleteFormat = "DELETE FROM `%s`.`%s` WHERE %s LIMIT 1;"
+)
+
+const (
+	stdout = "stdout"
+	layout = "2006-01-02 15:04:05"
 )
 
 type Flashback struct {
@@ -46,36 +50,40 @@ type Flashback struct {
 	onlyDML     bool                               // ignore ddl
 
 	// output args
-	outputFile   string
-	noPrimaryKey bool
-	flashback    bool
+	outputFile string
+	flashback  bool
 
 	// assist field
-	allLogs    map[string]int // map[filePath]index
-	outputChan chan string
-	exitChan   chan struct{}
+	allLogs           map[string]int        // map[filePath]index
+	gtidEventType     replication.EventType // QUERY when gtid mode on, otherwise ANONYMOUS_GTID
+	gtidEventStartPos uint32                // fix CUD event's start pos
+	outputChan        chan string
+	exitChan          chan struct{}
 }
 
 func NewFlashback(
 	mysqlUri string, startFile string, startPos uint32, startTime string,
 	stopFile string, stopPos uint32, stopTime string, gtidRegexp string,
 	database string, onlyTables []string, onlySqlType []string, onlyDML bool,
-	filterTx bool, outputFile string, noPrimaryKey bool, flashback bool,
+	filterTx bool, outputFile string, flashback bool,
 ) *Flashback {
-	if stopFile == "" {
-		stopFile = startFile
+	if startFile == "" {
+		panic("err: start File must exist")
+	}
+	if stopFile == "" && stopPos != 0 {
+		panic("err: stopFile is empty but stopPos not")
 	}
 
 	var startT, stopT uint32
 	if startTime != "" {
-		start, err := time.Parse(layout, startTime)
+		start, err := time.ParseInLocation(layout, startTime, time.Local)
 		if err != nil {
 			panic("start time format is illegal")
 		}
 		startT = uint32(start.Unix())
 	}
 	if stopTime != "" {
-		stop, err := time.Parse(layout, stopTime)
+		stop, err := time.ParseInLocation(layout, stopTime, time.Local)
 		if err != nil {
 			panic("start time format is illegal")
 		}
@@ -105,6 +113,9 @@ func NewFlashback(
 		tables[table] = struct{}{}
 	}
 
+	if len(onlySqlType) == 0 {
+		onlySqlType = []string{"INSERT", "UPDATE", "DELETE"}
+	}
 	types := make(map[replication.EventType]struct{}, len(onlySqlType))
 	for _, t := range onlySqlType {
 		switch strings.ToUpper(t) {
@@ -120,6 +131,19 @@ func NewFlashback(
 		}
 	}
 
+	gitdModeOn, err := getGitdModeFromDb(dbm.db)
+	if err != nil {
+		panic(err)
+	}
+	gitdEventType := replication.ANONYMOUS_GTID_EVENT
+	if gitdModeOn {
+		gitdEventType = replication.QUERY_EVENT
+	}
+
+	if outputFile == "" {
+		outputFile = stdout
+	}
+
 	// 使用flashback功能将自动修改以下属性
 	if flashback {
 		filterTx = true
@@ -127,25 +151,25 @@ func NewFlashback(
 	}
 
 	fb := &Flashback{
-		mysqlUri:     mysqlUri,
-		startFile:    startFile,
-		startPos:     startPos,
-		startTime:    startT,
-		stopFile:     stopFile,
-		stopPos:      stopPos,
-		stopTime:     stopT,
-		gtidRegexp:   GTIDRegexp,
-		database:     database,
-		onlyTables:   tables,
-		onlySqlType:  types,
-		filterTx:     filterTx,
-		onlyDML:      onlyDML,
-		outputFile:   outputFile,
-		noPrimaryKey: noPrimaryKey,
-		flashback:    flashback,
-		allLogs:      allLogs,
-		outputChan:   make(chan string, 2<<10),
-		exitChan:     make(chan struct{}, 1),
+		mysqlUri:      mysqlUri,
+		startFile:     startFile,
+		startPos:      startPos,
+		startTime:     startT,
+		stopFile:      stopFile,
+		stopPos:       stopPos,
+		stopTime:      stopT,
+		gtidRegexp:    GTIDRegexp,
+		database:      database,
+		onlyTables:    tables,
+		onlySqlType:   types,
+		filterTx:      filterTx,
+		onlyDML:       onlyDML,
+		outputFile:    outputFile,
+		flashback:     flashback,
+		allLogs:       allLogs,
+		gtidEventType: gitdEventType,
+		outputChan:    make(chan string, 2<<10),
+		exitChan:      make(chan struct{}, 1),
 	}
 	go fb.output()
 	return fb
@@ -170,16 +194,21 @@ func (fb *Flashback) filterEvent(binlog *BinlogInfo, e *replication.BinlogEvent)
 		return nil, StopError
 	}
 
-	if logIdx, ok := fb.allLogs[binlog.path]; !ok || logIdx > fb.allLogs[fb.stopFile] {
-		return nil, StopError
-	}
-
-	if fb.startPos != 0 && fb.startFile == fb.stopFile && e.Header.LogPos < fb.startPos {
+	// 只解析一个文件的情况
+	if fb.startFile == fb.stopFile && fb.startPos != 0 && e.Header.LogPos < fb.startPos {
 		return
 	}
 
-	if fb.stopPos != 0 && binlog.path == fb.stopFile && e.Header.LogPos > fb.stopPos {
-		return nil, StopError
+	if fb.stopFile != "" {
+		// 解析到结束位置的情况
+		if fb.stopPos != 0 && binlog.path == fb.stopFile && e.Header.LogPos > fb.stopPos {
+			return nil, StopError
+		}
+
+		// 解析到结束文件的情况
+		if logIdx, ok := fb.allLogs[binlog.path]; !ok || logIdx > fb.allLogs[fb.stopFile] {
+			return nil, StopError
+		}
 	}
 
 	if fb.gtidRegexp != nil && e.Header.EventType == replication.GTID_EVENT {
@@ -191,11 +220,12 @@ func (fb *Flashback) filterEvent(binlog *BinlogInfo, e *replication.BinlogEvent)
 
 	switch e.Header.EventType {
 	case replication.QUERY_EVENT:
-		if fb.onlyDML {
-			return
-		}
 		queryEvent := e.Event.(*replication.QueryEvent)
 		if ok := string(queryEvent.Schema) == fb.database; !ok {
+			return
+		}
+		// len(queryEvent.Query) != 5: 优化一点性能
+		if fb.onlyDML && len(queryEvent.Query) != 5 && string(queryEvent.Query) != "BEGIN" {
 			return
 		}
 	case replication.TABLE_MAP_EVENT:
@@ -226,9 +256,10 @@ func (fb *Flashback) filterEvent(binlog *BinlogInfo, e *replication.BinlogEvent)
 	return e, nil
 }
 
-// binlog本身不包含table field 数据,因此需要去数据库里拿
-func (fb *Flashback) fixTableMap(dbm *DBMap, e *replication.BinlogEvent) error {
-	if e.Header.EventType == replication.TABLE_MAP_EVENT {
+func (fb *Flashback) prepare(dbm *DBMap, e *replication.BinlogEvent) error {
+	switch e.Header.EventType {
+	// binlog本身不包含table field 数据,因此需要去数据库里拿
+	case replication.TABLE_MAP_EVENT:
 		tableMapEvent := e.Event.(*replication.TableMapEvent)
 		tableId := tableMapEvent.TableID
 		schema := string(tableMapEvent.Schema)
@@ -236,20 +267,25 @@ func (fb *Flashback) fixTableMap(dbm *DBMap, e *replication.BinlogEvent) error {
 		if err := dbm.Add(tableId, schema, table); err != nil {
 			return errors.Trace(err)
 		}
+	// CUD操作是放在事务里的,因此这些event的start pos应该为:
+	//   - 若没开启gitd, 为anonymousGitdEvent的值
+	//   - 若开启gitd, 为QueryEvent的值
+	case fb.gtidEventType:
+		fb.gtidEventStartPos = e.Header.LogPos - e.Header.EventSize
 	}
 	return nil
 }
 
 func (fb *Flashback) flashbackFunc(dbm *DBMap, binlog *BinlogInfo, event *replication.BinlogEvent) (err error) {
+	if err = fb.prepare(dbm, event); err != nil {
+		return errors.Trace(err)
+	}
 	event, err = fb.filterEvent(binlog, event)
 	if err != nil {
 		return StopError
 	}
 	if event == nil {
 		return nil // 已经被过滤
-	}
-	if err = fb.fixTableMap(dbm, event); err != nil {
-		return errors.Trace(err)
 	}
 	if err = fb.outputSql(dbm, binlog, event); err != nil {
 		return errors.Trace(err)
@@ -260,6 +296,7 @@ func (fb *Flashback) flashbackFunc(dbm *DBMap, binlog *BinlogInfo, event *replic
 func (fb *Flashback) outputSql(dbm *DBMap, binlog *BinlogInfo, e *replication.BinlogEvent) (err error) {
 	var content string
 	var outputFormat string
+	startPos := e.Header.LogPos - e.Header.EventSize
 
 	switch e.Header.EventType {
 	case replication.QUERY_EVENT:
@@ -275,6 +312,12 @@ func (fb *Flashback) outputSql(dbm *DBMap, binlog *BinlogInfo, e *replication.Bi
 			content = query
 		}
 
+	case replication.ANONYMOUS_GTID_EVENT:
+		if !fb.filterTx {
+			outputFormat = SqlGtidFormat
+			content = "Transaction Group"
+		}
+
 	case replication.XID_EVENT:
 		if !fb.filterTx {
 			outputFormat = SqlCommitFormat
@@ -288,6 +331,7 @@ func (fb *Flashback) outputSql(dbm *DBMap, binlog *BinlogInfo, e *replication.Bi
 		replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
 
 		outputFormat = SqlRowFormat
+		startPos = fb.gtidEventStartPos
 
 		rowsEvent := e.Event.(*replication.RowsEvent)
 		tableId := rowsEvent.TableID
@@ -330,7 +374,7 @@ func (fb *Flashback) outputSql(dbm *DBMap, binlog *BinlogInfo, e *replication.Bi
 		outputFormat,
 		content,
 		binlog.name,
-		e.Header.LogPos-e.Header.EventSize,
+		startPos,
 		e.Header.LogPos,
 		time.Unix(int64(e.Header.Timestamp), 0).Format(layout),
 	)
