@@ -538,15 +538,16 @@ func reverseFile(file string) {
 
 		if char[0] == '\n' {
 			if buff.Len() > 0 {
-				data := reverse(buff.Bytes())
-				if _, err := newFile.Write(data); err != nil {
-					panic(err)
-				}
+				writerReversedBytes(newFile, buff.Bytes())
 			}
 			buff.Reset()
 		}
 
 		if cursor == -filesize {
+			if buff.Len() > 0 {
+				buff.WriteByte('\n')
+				writerReversedBytes(newFile, buff.Bytes())
+			}
 			break
 		}
 	}
@@ -562,6 +563,13 @@ func reverse(s []byte) []byte {
 		b.WriteByte(s[i])
 	}
 	return b.Bytes()
+}
+
+func writerReversedBytes(file *os.File, b []byte) {
+	data := reverse(b)
+	if _, err := file.Write(data); err != nil {
+		panic(err)
+	}
 }
 
 func MustOpen(file string, flag int) *os.File {
