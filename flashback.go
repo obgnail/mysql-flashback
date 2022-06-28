@@ -433,29 +433,39 @@ func buildSqlFieldValue(value interface{}) string {
 		return fmt.Sprintf("%v", value)
 	case reflect.Bool:
 		return fmt.Sprintf("%v", value)
+		// text, longtext
+	case reflect.Slice:
+		s, ok := reflect.ValueOf(value).Interface().([]byte)
+		if !ok {
+			return fmt.Sprintf("---Invalid---: '%v'", value)
+		}
+		return fmt.Sprintf("'%s'", string(s))
 	case reflect.Uintptr, reflect.Complex64, reflect.Complex128, reflect.Array, reflect.Chan,
-		reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice,
-		reflect.Struct, reflect.UnsafePointer, reflect.Invalid:
-		return ""
+		reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Struct,
+		reflect.UnsafePointer:
+		return fmt.Sprintf("---Invalid---: '%v'", value)
+	case reflect.Invalid:
+		return fmt.Sprintf("---Invalid---: '%v'", value)
 	default:
-		return ""
+		return fmt.Sprintf("---Invalid---: '%v'", value)
 	}
 }
 
-func buildEqualExp(key, value string) string {
+func buildEqualExp(key, value string, inWhere bool) string {
 	// if v is NULL, may need to process
-	if value == "NULL" {
+	if inWhere && value == "NULL" {
 		return fmt.Sprintf("`%s` IS %s", key, value)
 	}
+	// in Set
 	return fmt.Sprintf("`%s`=%s", key, value)
 }
 
-func buildSqlFieldsExp(mapIdxToFieldName map[int]string, fields []interface{}) []string {
+func buildSqlFieldsExp(mapIdxToFieldName map[int]string, fields []interface{}, inWhere bool) []string {
 	res := make([]string, len(fields))
 	for idx, field := range fields {
 		key := mapIdxToFieldName[idx]
 		value := buildSqlFieldValue(field)
-		res[idx] = buildEqualExp(key, value)
+		res[idx] = buildEqualExp(key, value, inWhere)
 	}
 	return res
 }
@@ -483,20 +493,20 @@ func genUpdateSql(tableMetadata *TableMetadata, rowsEvent *replication.RowsEvent
 		idx1, idx2 = idx2, idx1
 	}
 
-	beforeFields := buildSqlFieldsExp(tableMetadata.Fields, rowsEvent.Rows[idx1])
-	updatedFields := buildSqlFieldsExp(tableMetadata.Fields, rowsEvent.Rows[idx2])
+	whereFields := buildSqlFieldsExp(tableMetadata.Fields, rowsEvent.Rows[idx1], true)
+	setFields := buildSqlFieldsExp(tableMetadata.Fields, rowsEvent.Rows[idx2], false)
 	content := fmt.Sprintf(
 		SqlUpdateFormat,
 		tableMetadata.Schema,
 		tableMetadata.Table,
-		strings.Join(updatedFields, ", "),
-		strings.Join(beforeFields, " AND "),
+		strings.Join(setFields, ", "),
+		strings.Join(whereFields, " AND "),
 	)
 	return content
 }
 
 func genDeleteSql(tableMetadata *TableMetadata, rowsEvent *replication.RowsEvent) string {
-	fields := buildSqlFieldsExp(tableMetadata.Fields, rowsEvent.Rows[0])
+	fields := buildSqlFieldsExp(tableMetadata.Fields, rowsEvent.Rows[0], true)
 	content := fmt.Sprintf(
 		SqlDeleteFormat,
 		tableMetadata.Schema,
